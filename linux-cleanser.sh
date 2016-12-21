@@ -1,4 +1,4 @@
-#This has been adapted from the kali-cleaner by THIS GUY
+#This has been adapted from the kali-cleaner by MasterButcher
 #Kudos to him for the difficult bit.
 
 #!/bin/bash
