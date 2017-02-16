@@ -1,7 +1,5 @@
-#This has been adapted from the kali-cleaner by MasterButcher
-#Kudos to him for the difficult bit.
-
 #!/bin/bash
+
 echo -e
 echo -e
 GRAY="\033[1;30m"
@@ -55,6 +53,9 @@ sudo aptitude purge $OLDKERNELS
 echo -e $YELLOW"[Linux-cleanser]:Emptying the trash..."$ENDCOLOR
 rm -rf /home/*/.local/share/Trash/*/** &> /dev/null
 rm -rf /root/.local/share/Trash/*/** &> /dev/null
+
+echo -e $YELLOW"[Linux-cleanser]:Clearing all bash history..."$ENDCOLOR
+rm ~/.bash_history
 
 echo -e $YELLOW"[Linux-cleanser]:Script Finished!"$ENDCOLOR
 echo -e
