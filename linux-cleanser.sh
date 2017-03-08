@@ -40,15 +40,15 @@ echo -e $YELLOW"[Linux-cleanser]:Removing redundant dependencies..."$ENDCOLOR
 sudo apt-get -y autoremove
 
 echo -e $YELLOW"[Linux-cleanser]:Cleaning apt cache..."$ENDCOLOR
-sudo aptitude clean
+sudo apt-get clean
 
 echo -e $YELLOW"[Linux-cleanser]:Found old config files: "$ENDCOLOR $OLDCONF
 echo -e $YELLOW"[Linux-cleanser]:Removing old config files..."$ENDCOLOR
-sudo aptitude purge $OLDCONF
+sudo apt-get purge $OLDCONF
 
 echo -e $YELLOW"[Linux-cleanser]:Found old kernel files: "$ENDCOLOR $OLDKERNELS
 echo -e $YELLOW"[Linux-cleanser]:Removing old kernels..."$ENDCOLOR
-sudo aptitude purge $OLDKERNELS
+sudo apt-get purge $OLDKERNELS
 
 echo -e $YELLOW"[Linux-cleanser]:Emptying the trash..."$ENDCOLOR
 rm -rf /home/*/.local/share/Trash/*/** &> /dev/null
