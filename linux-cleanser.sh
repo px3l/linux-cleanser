@@ -54,8 +54,15 @@ echo -e $YELLOW"[Linux-cleanser]:Emptying the trash..."$ENDCOLOR
 rm -rf /home/*/.local/share/Trash/*/** &> /dev/null
 rm -rf /root/.local/share/Trash/*/** &> /dev/null
 
-echo -e $YELLOW"[Linux-cleanser]:Clearing all bash history..."$ENDCOLOR
-rm ~/.bash_history
+read -p $YELLOW"[Linux-updater]:This will clear all bash history. Do you want to clear bash history? y / n"$ENDCOLOR -n 1 -r
+echo -e
+if [[ $REPLY =~ ^[Yy]$ ]]
+then
+	echo -e $YELLOW"[Linux-cleanser]:Clearing all bash history..."$ENDCOLOR
+	rm -rf ~/.bash_history
+fi
+
+
 
 echo -e $YELLOW"[Linux-cleanser]:Script Finished!"$ENDCOLOR
 echo -e
