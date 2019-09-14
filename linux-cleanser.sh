@@ -43,18 +43,24 @@ echo -e $YELLOW"[Linux-cleanser]:Cleaning apt cache..."$ENDCOLOR
 sudo apt-get clean
 
 echo -e $YELLOW"[Linux-cleanser]:Found old config files: "$ENDCOLOR $OLDCONF
-echo -e $YELLOW"[Linux-cleanser]:Removing old config files..."$ENDCOLOR
-sudo apt-get purge $OLDCONF
+read -p "$(echo -e $YELLOW"[Linux-cleanser]:Do you want to remove old config files? (y / n)    "$ENDCOLOR)" -n 1 -r
+echo -e
+if [[ $REPLY =~ ^[Yy]$ ]]
+then
+	echo -e $YELLOW"[Linux-cleanser]:Removing old config files..."$ENDCOLOR
+	sudo apt-get purge $OLDCONF
+fi
 
 echo -e $YELLOW"[Linux-cleanser]:Found old kernel files: "$ENDCOLOR $OLDKERNELS
-echo -e $YELLOW"[Linux-cleanser]:Removing old kernels..."$ENDCOLOR
-sudo apt-get purge $OLDKERNELS
+read -p "$(echo -e $YELLOW"[Linux-cleanser]:Do you want to remove old kernel files? (y / n)    "$ENDCOLOR)" -n 1 -r
+echo -e
+if [[ $REPLY =~ ^[Yy]$ ]]
+then
+	echo -e $YELLOW"[Linux-cleanser]:Removing old kernels..."$ENDCOLOR
+	sudo apt-get purge $OLDKERNELS
+fi
 
-echo -e $YELLOW"[Linux-cleanser]:Emptying the trash..."$ENDCOLOR
-rm -rf /home/*/.local/share/Trash/*/** &> /dev/null
-rm -rf /root/.local/share/Trash/*/** &> /dev/null
-
-read -p "[Linux-updater]:This will clear all bash history. Do you want to clear bash history? (y / n)    " -n 1 -r
+read -p "$(echo -e $YELLOW"[Linux-cleanser]:This will clear all bash history. Do you want to clear bash history? (y / n)    "$ENDCOLOR)" -n 1 -r
 echo -e
 if [[ $REPLY =~ ^[Yy]$ ]]
 then
@@ -62,7 +68,9 @@ then
 	rm -rf ~/.bash_history
 fi
 
-
+echo -e $YELLOW"[Linux-cleanser]:Emptying the trash..."$ENDCOLOR
+rm -rf /home/*/.local/share/Trash/*/** &> /dev/null
+rm -rf /root/.local/share/Trash/*/** &> /dev/null
 
 echo -e $YELLOW"[Linux-cleanser]:Script Finished!"$ENDCOLOR
 echo -e
