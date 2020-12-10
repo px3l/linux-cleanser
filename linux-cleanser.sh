@@ -35,9 +35,11 @@ sudo apt-get clean
 
 echo -e $YELLOW"[Linux-cleanser]:Clearing non-necessary packages..."$ENDCOLOR
 sudo apt-get autoclean
+sudo apt-get clean
 
 echo -e $YELLOW"[Linux-cleanser]:Removing redundant dependencies..."$ENDCOLOR
 sudo apt-get -y autoremove
+sudo apt-get -y autoremove --purge
 
 echo -e $YELLOW"[Linux-cleanser]:Cleaning apt cache..."$ENDCOLOR
 sudo apt-get clean
