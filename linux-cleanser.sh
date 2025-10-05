@@ -32,6 +32,47 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Function to check if Node.js/npm is installed and protect it
+check_nodejs_protection() {
+    local nodejs_paths=(
+        "/usr/bin/node"
+        "/usr/bin/npm"
+        "/usr/local/bin/node"
+        "/usr/local/bin/npm"
+        "/home/*/.nvm"
+        "/opt/node"
+        "/usr/share/nodejs"
+    )
+    
+    local protected_paths=()
+    
+    for path in "${nodejs_paths[@]}"; do
+        if [[ -e "$path" ]] || [[ -d "$path" ]]; then
+            protected_paths+=("$path")
+        fi
+    done
+    
+    if [[ ${#protected_paths[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}[Linux-cleanser]:Node.js/npm detected. Adding protection...${ENDCOLOR}"
+        echo -e "${GREEN}  Protected paths: ${protected_paths[*]}${ENDCOLOR}"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Function to safely clean broken symlinks (protecting Node.js)
+clean_broken_symlinks_safe() {
+    if ask_user "Do you want to clean broken symlinks (Node.js/npm protected)?"; then
+        echo -e "${YELLOW}[Linux-cleanser]:Cleaning broken symlinks (protecting Node.js/npm)...${ENDCOLOR}"
+        
+        # Clean broken symlinks but exclude Node.js/npm related paths
+        find /home -type l -xtype l -not -path "*/node_modules/*" -not -path "*/.nvm/*" -not -path "*/npm/*" -delete 2>/dev/null || true
+        find /usr -type l -xtype l -not -path "*/node_modules/*" -not -path "*/npm/*" -not -path "*/nodejs/*" -delete 2>/dev/null || true
+        find /opt -type l -xtype l -not -path "*/node_modules/*" -not -path "*/npm/*" -not -path "*/node/*" -delete 2>/dev/null || true
+    fi
+}
+
 # Show banner
 show_banner() {
     echo -e
@@ -54,6 +95,9 @@ check_prerequisites() {
     
     # Check disk space
     check_disk_space
+    
+    # Check for Node.js/npm and add protection
+    check_nodejs_protection
     
     # Load configuration
     load_config
@@ -126,9 +170,9 @@ create_backup() {
     dpkg --get-selections > "/tmp/package-list-$(date +%Y%m%d-%H%M%S).txt"
 }
 
-# Clean package cache more thoroughly
+# Clean package cache more thoroughly (protecting npm cache)
 clean_package_cache() {
-    if ask_user "Do you want to clean package cache (apt, snap, flatpak)?"; then
+    if ask_user "Do you want to clean package cache (apt, snap, flatpak, npm cache protected)?"; then
         echo -e "${YELLOW}[Linux-cleanser]:Flushing local cache from the retrieved package files...${ENDCOLOR}"
         apt-get clean
         
@@ -152,6 +196,10 @@ clean_package_cache() {
             echo -e "${YELLOW}[Linux-cleanser]:Cleaning flatpak cache...${ENDCOLOR}"
             flatpak uninstall --unused -y 2>/dev/null || true
         fi
+        
+        # Protect npm cache - don't clean it automatically
+        echo -e "${GREEN}[Linux-cleanser]:npm cache protected from automatic cleaning${ENDCOLOR}"
+        echo -e "${YELLOW}[Linux-cleanser]:To clean npm cache manually, run: npm cache clean --force${ENDCOLOR}"
     fi
 }
 
@@ -164,12 +212,13 @@ clean_journal_logs() {
     fi
 }
 
-# Clean temporary files
+# Clean temporary files (protecting Node.js/npm)
 clean_temp_files() {
-    if ask_user "Do you want to clean temporary files (older than 7 days)?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning temporary files...${ENDCOLOR}"
-        find /tmp -type f -atime +7 -delete 2>/dev/null || true
-        find /var/tmp -type f -atime +7 -delete 2>/dev/null || true
+    if ask_user "Do you want to clean temporary files (older than 7 days, Node.js/npm protected)?"; then
+        echo -e "${YELLOW}[Linux-cleanser]:Cleaning temporary files (protecting Node.js/npm)...${ENDCOLOR}"
+        # Clean temp files but exclude Node.js/npm related files
+        find /tmp -type f -atime +7 -not -name "*node*" -not -name "*npm*" -delete 2>/dev/null || true
+        find /var/tmp -type f -atime +7 -not -name "*node*" -not -name "*npm*" -delete 2>/dev/null || true
     fi
 }
 
@@ -182,13 +231,9 @@ clean_old_logs() {
     fi
 }
 
-# Clean broken symlinks
+# Clean broken symlinks (replaced with safe version)
 clean_broken_symlinks() {
-    if ask_user "Do you want to clean broken symlinks?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning broken symlinks...${ENDCOLOR}"
-        find /home -type l -xtype l -delete 2>/dev/null || true
-        find /usr -type l -xtype l -delete 2>/dev/null || true
-    fi
+    clean_broken_symlinks_safe
 }
 
 # Clean browser caches
@@ -246,6 +291,28 @@ handle_bash_history() {
     fi
 }
 
+# Safe Node.js/npm cleanup options
+clean_nodejs_safe() {
+    if ask_user "Do you want to clean Node.js/npm safely (node_modules, npm cache)?"; then
+        echo -e "${YELLOW}[Linux-cleanser]:Cleaning Node.js/npm safely...${ENDCOLOR}"
+        
+        # Clean npm cache safely
+        if command_exists npm; then
+            echo -e "${YELLOW}[Linux-cleanser]:Cleaning npm cache...${ENDCOLOR}"
+            npm cache clean --force 2>/dev/null || true
+        fi
+        
+        # Clean node_modules in common locations (but be careful)
+        echo -e "${YELLOW}[Linux-cleanser]:Cleaning node_modules in common locations...${ENDCOLOR}"
+        find /home -name "node_modules" -type d -exec rm -rf {} + 2>/dev/null || true
+        
+        # Clean npm temporary files
+        echo -e "${YELLOW}[Linux-cleanser]:Cleaning npm temporary files...${ENDCOLOR}"
+        find /tmp -name "npm-*" -type d -exec rm -rf {} + 2>/dev/null || true
+        find /tmp -name ".npm" -type d -exec rm -rf {} + 2>/dev/null || true
+    fi
+}
+
 # Show summary
 show_summary() {
     echo -e "${YELLOW}[Linux-cleanser]:Script Finished!${ENDCOLOR}"
@@ -295,6 +362,9 @@ main() {
     # Clean user files
     clean_browser_caches
     clean_thumbnail_cache
+    
+    # Clean Node.js/npm safely
+    clean_nodejs_safe
     
     # Handle bash history
     handle_bash_history
