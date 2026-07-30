@@ -1,7 +1,14 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Linux-cleanser by px3l
+# Interactive system cleanup for Debian-based distributions.
+#
+# Run with --dry-run first. Every destructive action is gated behind a prompt
+# and printed before it happens.
 
-# Exit on any error
-set -e
+set -euo pipefail
+
+VERSION="2.0.0"
 
 # Color definitions
 RED="\033[0;31m"
@@ -11,374 +18,623 @@ BLUE="\033[0;34m"
 ENDCOLOR="\033[0m"
 
 # Configuration
-CONFIG_FILE="/etc/linux-cleanser.conf"
-LOG_FILE="/var/log/linux-cleanser.log"
+CONFIG_FILE="${CONFIG_FILE:-/etc/linux-cleanser.conf}"
+LOG_FILE="${LOG_FILE:-/var/log/linux-cleanser.log}"
 
-# Global variables
-OLDCONF=$(dpkg -l|grep "^rc"|awk '{print $2}')
-CURKERNEL=$(uname -r|sed 's/-*[a-z]//g'|sed 's/-386//g')
-LINUXPKG="linux-(image|headers|debian-modules|restricted-modules)"
-METALINUXPKG="linux-(image|headers|restricted-modules)-(generic|i386|server|common|rt|xen)"
-OLDKERNELS=$(dpkg -l|awk '{print $2}'|grep -E $LINUXPKG|grep -vE $METALINUXPKG|grep -v $CURKERNEL)
+# Runtime flags
+DRY_RUN=0
+ASSUME_YES=0
+AGGRESSIVE=0
 
-# Function to handle errors
+# Resolved in check_prerequisites
+REAL_USER=""
+REAL_HOME=""
+BACKUP_DIR=""
+
+# Running total of bytes freed
+TOTAL_RECLAIMED=0
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+say()  { echo -e "${YELLOW}[Linux-cleanser]: $1${ENDCOLOR}"; }
+ok()   { echo -e "${GREEN}  $1${ENDCOLOR}"; }
+warn() { echo -e "${RED}[Linux-cleanser]: $1${ENDCOLOR}"; }
+
+log_message() {
+    local level="$1" message="$2"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    # Braces so a failed redirect is swallowed too, not just echo's own stderr.
+    { echo "[$timestamp] [$level] $message" >> "$LOG_FILE"; } 2>/dev/null || true
+}
+
 error_exit() {
-    echo -e "${RED}[ERROR]: $1${ENDCOLOR}" >&2
+    warn "[ERROR]: $1"
+    log_message "ERROR" "$1"
     exit 1
 }
 
-# Function to check if command exists
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
+show_banner() {
+    echo
+    echo -e "${BLUE}  ====================================================  ${ENDCOLOR}"
+    echo -e "${BLUE} ===                                                === ${ENDCOLOR}"
+    echo -e "${BLUE}==               ${RED}Linux-cleanser by px3l${BLUE}               ==${ENDCOLOR}"
+    echo -e "${BLUE} ===                     ${ENDCOLOR}v${VERSION}${BLUE}                      === ${ENDCOLOR}"
+    echo -e "${BLUE}  ====================================================  ${ENDCOLOR}"
+    echo
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo -e "${BLUE}  DRY RUN — nothing will be deleted.${ENDCOLOR}"
+        echo
+    fi
 }
 
-# Function to check if Node.js/npm is installed and protect it
-check_nodejs_protection() {
-    local nodejs_paths=(
-        "/usr/bin/node"
-        "/usr/bin/npm"
-        "/usr/local/bin/node"
-        "/usr/local/bin/npm"
-        "/home/*/.nvm"
-        "/opt/node"
-        "/usr/share/nodejs"
-    )
-    
-    local protected_paths=()
-    
-    for path in "${nodejs_paths[@]}"; do
-        if [[ -e "$path" ]] || [[ -d "$path" ]]; then
-            protected_paths+=("$path")
-        fi
+usage() {
+    cat <<'EOF'
+Usage: sudo ./linux-cleanser.sh [OPTIONS]
+
+Options:
+  -n, --dry-run      Show what would be removed without deleting anything.
+  -y, --yes          Assume yes for every prompt. Implies you know what you are doing.
+  -a, --aggressive   Also offer deeper cleanups (all unused Docker images,
+                     full build cache, whole ~/.cache). Still prompts.
+  -h, --help         Show this help and exit.
+
+Run with --dry-run first. Docker volumes are never removed; they are only
+listed, because "dangling" does not mean "unwanted".
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--dry-run)    DRY_RUN=1 ;;
+            -y|--yes)        ASSUME_YES=1 ;;
+            -a|--aggressive) AGGRESSIVE=1 ;;
+            -h|--help)       usage; exit 0 ;;
+            *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+        esac
+        shift
     done
-    
-    if [[ ${#protected_paths[@]} -gt 0 ]]; then
-        echo -e "${YELLOW}[Linux-cleanser]:Node.js/npm detected. Adding protection...${ENDCOLOR}"
-        echo -e "${GREEN}  Protected paths: ${protected_paths[*]}${ENDCOLOR}"
+}
+
+# ---------------------------------------------------------------------------
+# Core helpers
+# ---------------------------------------------------------------------------
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+ask_user() {
+    local message="$1" default="${2:-n}" prompt reply
+
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        log_message "PROMPT" "$message -> auto-yes"
         return 0
     fi
-    
+
+    if [[ "$default" == "y" ]]; then
+        prompt="[Linux-cleanser]: $message (Y/n): "
+    else
+        prompt="[Linux-cleanser]: $message (y/N): "
+    fi
+
+    read -r -p "$(echo -e "${YELLOW}${prompt}${ENDCOLOR}")" -n 1 reply
+    echo
+
+    if [[ "$default" == "y" ]]; then
+        [[ "$reply" =~ ^[Nn]$ ]] && { log_message "PROMPT" "$message -> no"; return 1; }
+        log_message "PROMPT" "$message -> yes"
+        return 0
+    fi
+
+    if [[ "$reply" =~ ^[Yy]$ ]]; then
+        log_message "PROMPT" "$message -> yes"
+        return 0
+    fi
+
+    log_message "PROMPT" "$message -> no"
     return 1
 }
 
-# Function to safely clean broken symlinks (protecting Node.js)
-clean_broken_symlinks_safe() {
-    if ask_user "Do you want to clean broken symlinks (Node.js/npm protected)?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning broken symlinks (protecting Node.js/npm)...${ENDCOLOR}"
-        
-        # Clean broken symlinks but exclude Node.js/npm related paths
-        find /home -type l -xtype l -not -path "*/node_modules/*" -not -path "*/.nvm/*" -not -path "*/npm/*" -delete 2>/dev/null || true
-        find /usr -type l -xtype l -not -path "*/node_modules/*" -not -path "*/npm/*" -not -path "*/nodejs/*" -delete 2>/dev/null || true
-        find /opt -type l -xtype l -not -path "*/node_modules/*" -not -path "*/npm/*" -not -path "*/node/*" -delete 2>/dev/null || true
+# Execute a command, or describe it under --dry-run.
+run() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo -e "${BLUE}  [dry-run] $*${ENDCOLOR}"
+        log_message "DRYRUN" "$*"
+        return 0
+    fi
+    log_message "EXEC" "$*"
+    "$@"
+}
+
+# Execute a shell snippet (for pipelines and globs), or describe it.
+run_sh() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo -e "${BLUE}  [dry-run] sh -c: $1${ENDCOLOR}"
+        log_message "DRYRUN" "sh -c: $1"
+        return 0
+    fi
+    log_message "EXEC" "sh -c: $1"
+    bash -c "$1" || true
+}
+
+# Run a command as the invoking user rather than root.
+as_user() {
+    if [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]]; then
+        run "$@"
+        return
+    fi
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo -e "${BLUE}  [dry-run] (as $REAL_USER) $*${ENDCOLOR}"
+        log_message "DRYRUN" "as $REAL_USER: $*"
+        return 0
+    fi
+    log_message "EXEC" "as $REAL_USER: $*"
+    sudo -u "$REAL_USER" -H "$@"
+}
+
+dir_bytes() {
+    [[ -e "$1" ]] || { echo 0; return; }
+    # du exits non-zero on any unreadable child, and pipefail would otherwise
+    # let both the real total and a fallback "0" through.
+    local out
+    out=$(du -sb "$1" 2>/dev/null | cut -f1) || true
+    [[ "$out" =~ ^[0-9]+$ ]] || out=0
+    echo "$out"
+}
+
+human() {
+    numfmt --to=iec-i --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"
+}
+
+# Delete the *contents* of a directory, accounting for what was freed.
+reclaim_dir() {
+    local target="$1" label="${2:-$1}" bytes
+
+    [[ -d "$target" ]] || return 0
+    bytes=$(dir_bytes "$target")
+    [[ "$bytes" -eq 0 ]] && return 0
+
+    ok "$label — $(human "$bytes")"
+    run_sh "rm -rf -- '${target:?}'/* '${target:?}'/.[!.]* 2>/dev/null"
+
+    if [[ $DRY_RUN -eq 0 ]]; then
+        TOTAL_RECLAIMED=$((TOTAL_RECLAIMED + bytes))
     fi
 }
 
-# Show banner
-show_banner() {
-    echo -e
-    echo -e
-    echo -e $BLUE"  ====================================================  "$ENDCOLOR
-    echo -e $BLUE" ===                                                === "$ENDCOLOR
-    echo -e $BLUE"==               "$RED"Linux-cleanser by px3l"$BLUE"               =="$ENDCOLOR
-    echo -e $BLUE" ===                                                === "$ENDCOLOR
-    echo -e $BLUE"  ====================================================  "$ENDCOLOR
-    echo -e
-    echo -e
-}
+# ---------------------------------------------------------------------------
+# Prerequisites
+# ---------------------------------------------------------------------------
 
-# Function to check prerequisites
 check_prerequisites() {
-    # Check if running as root
     if [[ $EUID -ne 0 ]]; then
-        error_exit "This script must be run as root"
+        error_exit "This script must be run as root (try: sudo $0 --dry-run)"
     fi
-    
-    # Check disk space
+
+    # Resolve the human behind the sudo, so user-level caches hit the right home.
+    REAL_USER="${SUDO_USER:-root}"
+    REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+    [[ -d "$REAL_HOME" ]] || error_exit "Could not resolve home directory for '$REAL_USER'"
+
+    BACKUP_DIR="/var/backups/linux-cleanser"
+
+    say "Target user: $REAL_USER ($REAL_HOME)"
+    log_message "INFO" "Run started (user=$REAL_USER dry_run=$DRY_RUN aggressive=$AGGRESSIVE)"
+
     check_disk_space
-    
-    # Check for Node.js/npm and add protection
-    check_nodejs_protection
-    
-    # Load configuration
     load_config
 }
 
-# Function to check disk space before cleaning
 check_disk_space() {
-    local available_space=$(df / | awk 'NR==2 {print $4}')
-    local required_space=1048576  # 1GB in KB
-    
+    local available_space required_space=1048576  # 1GB in KB
+    available_space=$(df / | awk 'NR==2 {print $4}')
+
     if [[ $available_space -lt $required_space ]]; then
-        echo -e "${RED}[Linux-cleanser]:Warning: Low disk space detected!${ENDCOLOR}"
-        echo -e "${YELLOW}[Linux-cleanser]:Available: $(($available_space / 1024))MB${ENDCOLOR}"
-        if ! ask_user "Continue anyway?"; then
-            exit 1
-        fi
+        warn "Low disk space detected!"
+        say "Available: $((available_space / 1024))MB"
+        ask_user "Continue anyway?" || exit 1
     fi
 }
 
-# Load configuration if exists
 load_config() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        source "$CONFIG_FILE"
-    fi
+    # shellcheck source=/dev/null
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+    return 0
 }
 
-# Logging function
-log_message() {
-    local level="$1"
-    local message="$2"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
-}
-
-# Function to ask user with better formatting
-ask_user() {
-    local message="$1"
-    local default="${2:-n}"
-    local prompt="[Linux-cleanser]: $message (y/N): "
-    
-    if [[ "$default" == "y" ]]; then
-        prompt="[Linux-cleanser]: $message (Y/n): "
-    fi
-    
-    read -p "$(echo -e "${YELLOW}$prompt${ENDCOLOR}")" -n 1 -r
-    echo
-    
-    if [[ "$default" == "y" ]]; then
-        [[ $REPLY =~ ^[Nn]$ ]] && return 1
-    else
-        [[ $REPLY =~ ^[Yy]$ ]] && return 0
-    fi
-    
-    return 1
-}
-
-# Function to show what will be cleaned
-show_cleanup_preview() {
-    echo -e "${YELLOW}[Linux-cleanser]:Preview of what will be cleaned:${ENDCOLOR}"
-    echo -e "${GREEN}  - Package cache: $(du -sh /var/cache/apt/archives 2>/dev/null | cut -f1)${ENDCOLOR}"
-    echo -e "${GREEN}  - Old config files: $(echo "$OLDCONF" | wc -w) packages${ENDCOLOR}"
-    echo -e "${GREEN}  - Old kernels: $(echo "$OLDKERNELS" | wc -w) packages${ENDCOLOR}"
-    echo -e "${GREEN}  - Journal logs: $(journalctl --disk-usage 2>/dev/null | grep -o '[0-9.]*[A-Z]' || echo "Unknown")${ENDCOLOR}"
-    echo
-}
-
-# Create backup before cleaning
 create_backup() {
-    echo -e "${YELLOW}[Linux-cleanser]:Creating package list backup...${ENDCOLOR}"
-    dpkg --get-selections > "/tmp/package-list-$(date +%Y%m%d-%H%M%S).txt"
+    say "Creating package list backup..."
+    run mkdir -p "$BACKUP_DIR"
+    local dest="$BACKUP_DIR/package-list-$(date +%Y%m%d-%H%M%S).txt"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo -e "${BLUE}  [dry-run] dpkg --get-selections > $dest${ENDCOLOR}"
+    else
+        dpkg --get-selections > "$dest"
+        ok "Saved to $dest"
+        log_message "INFO" "Package list backed up to $dest"
+    fi
 }
 
-# Clean package cache more thoroughly (protecting npm cache)
+show_cleanup_preview() {
+    say "Scanning for reclaimable space (this takes a moment)..."
+    echo
+
+    local apt_c journal_c cache_c npm_c gradle_c oldconf_n
+
+    apt_c=$(dir_bytes /var/cache/apt/archives)
+    cache_c=$(dir_bytes "$REAL_HOME/.cache")
+    npm_c=$(dir_bytes "$REAL_HOME/.npm")
+    gradle_c=$(dir_bytes "$REAL_HOME/.gradle/caches")
+    journal_c=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]?' | head -1 || echo "?")
+    oldconf_n=$(dpkg -l 2>/dev/null | grep -c "^rc" || true)
+
+    ok "APT archives      $(human "$apt_c")"
+    ok "User cache        $(human "$cache_c")  ($REAL_HOME/.cache)"
+    ok "npm cache         $(human "$npm_c")"
+    ok "Gradle cache      $(human "$gradle_c")"
+    ok "Journal logs      ${journal_c}"
+    ok "Orphaned configs  ${oldconf_n} packages"
+
+    if command_exists docker && docker info >/dev/null 2>&1; then
+        echo
+        say "Docker:"
+        docker system df 2>/dev/null | sed 's/^/  /' || true
+    fi
+    echo
+}
+
+# ---------------------------------------------------------------------------
+# System cleanup
+# ---------------------------------------------------------------------------
+
 clean_package_cache() {
-    if ask_user "Do you want to clean package cache (apt, snap, flatpak, npm cache protected)?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Flushing local cache from the retrieved package files...${ENDCOLOR}"
-        apt-get clean
-        
-        echo -e "${YELLOW}[Linux-cleanser]:Clearing non-necessary packages...${ENDCOLOR}"
-        apt-get autoclean
-        apt-get clean
-        
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning apt cache...${ENDCOLOR}"
-        apt-get clean
-        
-        # Clean snap cache if available
-        if command_exists snap; then
-            echo -e "${YELLOW}[Linux-cleanser]:Cleaning snap cache...${ENDCOLOR}"
-            snap list --all | awk '/disabled/{print $1, $3}' | while read snapname revision; do
-                snap remove "$snapname" --revision="$revision" 2>/dev/null || true
-            done
-        fi
-        
-        # Clean flatpak cache if available
-        if command_exists flatpak; then
-            echo -e "${YELLOW}[Linux-cleanser]:Cleaning flatpak cache...${ENDCOLOR}"
-            flatpak uninstall --unused -y 2>/dev/null || true
-        fi
-        
-        # Protect npm cache - don't clean it automatically
-        echo -e "${GREEN}[Linux-cleanser]:npm cache protected from automatic cleaning${ENDCOLOR}"
-        echo -e "${YELLOW}[Linux-cleanser]:To clean npm cache manually, run: npm cache clean --force${ENDCOLOR}"
-    fi
+    ask_user "Clean the APT package cache?" || return 0
+    say "Flushing retrieved package files..."
+    run apt-get clean
+    run apt-get autoclean
 }
 
-# Clean systemd journal logs
+clean_autoremove() {
+    # apt's autoremove is also the correct, safe way to drop old kernels on
+    # Ubuntu/Mint. The old hand-rolled kernel regex has been removed because it
+    # would purge the newest kernel if you had updated but not yet rebooted.
+    ask_user "Remove packages no longer required (includes superseded kernels)?" || return 0
+    say "Removing redundant dependencies..."
+    run apt-get -y --purge autoremove
+}
+
+handle_old_configs() {
+    local oldconf
+    oldconf=$(dpkg -l 2>/dev/null | awk '/^rc/ {print $2}' || true)
+
+    if [[ -z "$oldconf" ]]; then
+        say "No orphaned config files found."
+        return 0
+    fi
+
+    say "Orphaned config files from removed packages:"
+    echo "$oldconf" | sed 's/^/    /'
+    ask_user "Purge these config files?" || return 0
+    # shellcheck disable=SC2086
+    run apt-get -y purge $oldconf
+}
+
 clean_journal_logs() {
-    if ask_user "Do you want to clean systemd journal logs?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning systemd journal logs...${ENDCOLOR}"
-        journalctl --vacuum-time=7d 2>/dev/null || true
-        journalctl --vacuum-size=100M 2>/dev/null || true
-    fi
+    ask_user "Vacuum systemd journal logs (keep 7 days / 100M)?" || return 0
+    say "Vacuuming systemd journal..."
+    run journalctl --vacuum-time=7d
+    run journalctl --vacuum-size=100M
 }
 
-# Clean temporary files (protecting Node.js/npm)
+clean_coredumps() {
+    [[ -d /var/lib/systemd/coredump ]] || return 0
+    local bytes
+    bytes=$(dir_bytes /var/lib/systemd/coredump)
+    [[ "$bytes" -lt 1048576 ]] && return 0
+
+    say "Core dumps: $(human "$bytes")"
+    ask_user "Remove stored core dumps?" || return 0
+    reclaim_dir /var/lib/systemd/coredump "core dumps"
+}
+
 clean_temp_files() {
-    if ask_user "Do you want to clean temporary files (older than 7 days, Node.js/npm protected)?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning temporary files (protecting Node.js/npm)...${ENDCOLOR}"
-        # Clean temp files but exclude Node.js/npm related files
-        find /tmp -type f -atime +7 -not -name "*node*" -not -name "*npm*" -delete 2>/dev/null || true
-        find /var/tmp -type f -atime +7 -not -name "*node*" -not -name "*npm*" -delete 2>/dev/null || true
-    fi
+    ask_user "Remove /tmp and /var/tmp files untouched for 7+ days?" || return 0
+    say "Cleaning stale temporary files..."
+    run_sh "find /tmp -xdev -type f -atime +7 -delete 2>/dev/null"
+    run_sh "find /var/tmp -xdev -type f -atime +7 -delete 2>/dev/null"
 }
 
-# Clean old log files
-clean_old_logs() {
-    if ask_user "Do you want to clean old log files (older than 30 days)?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning old log files...${ENDCOLOR}"
-        find /var/log -name "*.log" -type f -mtime +30 -delete 2>/dev/null || true
-        find /var/log -name "*.gz" -type f -mtime +30 -delete 2>/dev/null || true
-    fi
+clean_rotated_logs() {
+    # Only rotated/compressed logs. Deleting a live *.log that a daemon holds
+    # open does not free the space and silently stops that daemon logging.
+    ask_user "Remove rotated log archives older than 30 days?" || return 0
+    say "Cleaning rotated logs (active .log files are left alone)..."
+    run_sh "find /var/log -type f \\( -name '*.gz' -o -name '*.xz' -o -name '*.old' -o -regex '.*\\.[0-9]+' \\) -mtime +30 -delete 2>/dev/null"
 }
 
-# Clean broken symlinks (replaced with safe version)
-clean_broken_symlinks() {
-    clean_broken_symlinks_safe
-}
+# ---------------------------------------------------------------------------
+# User-level caches
+# ---------------------------------------------------------------------------
 
-# Clean browser caches
-clean_browser_caches() {
-    if ask_user "Do you want to clean browser caches?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning browser caches...${ENDCOLOR}"
-        for user_home in /home/*; do
-            if [[ -d "$user_home" ]]; then
-                username=$(basename "$user_home")
-                # Firefox
-                rm -rf "$user_home/.mozilla/firefox/*/Cache" 2>/dev/null || true
-                rm -rf "$user_home/.cache/mozilla" 2>/dev/null || true
-                # Chrome/Chromium
-                rm -rf "$user_home/.cache/google-chrome" 2>/dev/null || true
-                rm -rf "$user_home/.cache/chromium" 2>/dev/null || true
-                # Other browsers
-                rm -rf "$user_home/.cache/opera" 2>/dev/null || true
-            fi
+clean_user_caches() {
+    local cache_root="$REAL_HOME/.cache"
+    [[ -d "$cache_root" ]] || return 0
+
+    # XDG says ~/.cache is disposable, but a few entries hold state that is
+    # annoying rather than free to lose, so target the known-large ones.
+    local targets=(
+        mozilla sublime-text typescript Google BraveSoftware Chromium
+        google-chrome mesa_shader_cache thumbnails mintinstall appstream
+        fontconfig hugo_cache pip yarn go-build electron chromium
+    )
+
+    say "User caches under $cache_root:"
+    local found=0 name
+    for name in "${targets[@]}"; do
+        [[ -d "$cache_root/$name" ]] && { found=1; ok "$name — $(human "$(dir_bytes "$cache_root/$name")")"; }
+    done
+    [[ $found -eq 0 ]] && { say "Nothing to clean."; return 0; }
+
+    if ask_user "Clear these cache directories?"; then
+        for name in "${targets[@]}"; do
+            [[ -d "$cache_root/$name" ]] && reclaim_dir "$cache_root/$name" ".cache/$name"
         done
     fi
+
+    if [[ $AGGRESSIVE -eq 1 ]]; then
+        say "Whole cache directory: $(human "$(dir_bytes "$cache_root")")"
+        ask_user "Also clear EVERYTHING else under $cache_root?" && reclaim_dir "$cache_root" ".cache"
+    fi
 }
 
-# Clean thumbnail cache
+clean_browser_caches() {
+    # Note: these are unquoted on purpose so the profile globs expand.
+    ask_user "Clear browser profile caches?" || return 0
+    say "Clearing browser caches for $REAL_USER..."
+    run_sh "rm -rf ${REAL_HOME}/.mozilla/firefox/*/cache2 2>/dev/null"
+    run_sh "rm -rf ${REAL_HOME}/.config/BraveSoftware/*/Default/Cache 2>/dev/null"
+    run_sh "rm -rf ${REAL_HOME}/.config/google-chrome/*/Cache 2>/dev/null"
+    run_sh "rm -rf ${REAL_HOME}/.config/chromium/*/Cache 2>/dev/null"
+    # Flatpak browsers keep their own tree.
+    run_sh "rm -rf ${REAL_HOME}/.var/app/org.mozilla.firefox/cache/* 2>/dev/null"
+}
+
 clean_thumbnail_cache() {
-    if ask_user "Do you want to clean thumbnail cache?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning thumbnail cache...${ENDCOLOR}"
-        find /home/*/.cache/thumbnails -type f -delete 2>/dev/null || true
-        find /root/.cache/thumbnails -type f -delete 2>/dev/null || true
-    fi
+    local thumbs="$REAL_HOME/.cache/thumbnails"
+    [[ -d "$thumbs" ]] || return 0
+    say "Thumbnail cache: $(human "$(dir_bytes "$thumbs")")"
+    ask_user "Clear the thumbnail cache?" || return 0
+    reclaim_dir "$thumbs" "thumbnails"
 }
 
-# Handle old config files
-handle_old_configs() {
-    echo -e "${YELLOW}[Linux-cleanser]:Found old config files: ${ENDCOLOR}${GREEN} $OLDCONF${ENDCOLOR}"
-    if ask_user "Do you want to remove old config files?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Removing old config files...${ENDCOLOR}"
-        apt-get purge $OLDCONF 2>/dev/null || true
+# ---------------------------------------------------------------------------
+# Developer toolchain caches
+# ---------------------------------------------------------------------------
+
+clean_dev_caches() {
+    # This only ever touches *caches*. It never walks the filesystem deleting
+    # node_modules — that used to live here and would take out
+    # ~/.nvm/.../lib/node_modules, i.e. npm itself.
+    say "Developer toolchain caches:"
+
+    local npm_c="$REAL_HOME/.npm"
+    local pnpm_c="$REAL_HOME/.local/share/pnpm/store"
+    local yarn_c="$REAL_HOME/.cache/yarn"
+    local gradle_c="$REAL_HOME/.gradle/caches"
+    local pip_c="$REAL_HOME/.cache/pip"
+    local go_c="$REAL_HOME/go/pkg/mod"
+
+    local p bytes
+    for p in "$npm_c" "$pnpm_c" "$yarn_c" "$gradle_c" "$pip_c" "$go_c"; do
+        [[ -d "$p" ]] || continue
+        bytes=$(dir_bytes "$p")
+        [[ "$bytes" -gt 0 ]] && ok "${p/#$REAL_HOME/\~} — $(human "$bytes")"
+    done
+
+    ask_user "Clear developer toolchain caches?" || return 0
+
+    if command_exists npm && [[ -d "$npm_c" ]]; then
+        say "Cleaning npm cache..."
+        as_user npm cache clean --force
     fi
+    if command_exists pnpm && [[ -d "$pnpm_c" ]]; then
+        say "Pruning pnpm store..."
+        as_user pnpm store prune
+    fi
+    [[ -d "$yarn_c" ]]   && reclaim_dir "$yarn_c" "yarn cache"
+    [[ -d "$gradle_c" ]] && reclaim_dir "$gradle_c" "gradle caches"
+    [[ -d "$pip_c" ]]    && reclaim_dir "$pip_c" "pip cache"
+
+    if [[ -d "$go_c" ]] && command_exists go; then
+        say "Cleaning Go module cache..."
+        as_user go clean -modcache
+    fi
+    return 0
 }
 
-# Handle old kernels
-handle_old_kernels() {
-    echo -e "${YELLOW}[Linux-cleanser]:Found old kernel files: ${ENDCOLOR}${GREEN} $OLDKERNELS${ENDCOLOR}"
-    if ask_user "Do you want to remove old kernel files?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Removing old kernels...${ENDCOLOR}"
-        apt-get purge $OLDKERNELS 2>/dev/null || true
-    fi
-}
+# ---------------------------------------------------------------------------
+# Containers and sandboxed apps
+# ---------------------------------------------------------------------------
 
-# Handle bash history
-handle_bash_history() {
-    if ask_user "This will clear all bash history. Do you want to clear bash history?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Clearing all bash history...${ENDCOLOR}"
-        rm -rf ~/.bash_history 2>/dev/null || true
-    fi
-}
+# Print every stopped container with the volumes it holds, so the real cost of
+# removing it is visible at the prompt. Container prune reclaims almost nothing
+# in bytes; what it actually destroys is the only link between a project and an
+# anonymous volume holding its data.
+list_stopped_containers() {
+    local ids id name image state mounts mtype mname mdest anon=0
 
-# Safe Node.js/npm cleanup options
-clean_nodejs_safe() {
-    if ask_user "Do you want to clean Node.js/npm safely (node_modules, npm cache)?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning Node.js/npm safely...${ENDCOLOR}"
-        
-        # Clean npm cache safely
-        if command_exists npm; then
-            echo -e "${YELLOW}[Linux-cleanser]:Cleaning npm cache...${ENDCOLOR}"
-            npm cache clean --force 2>/dev/null || true
+    ids=$(docker ps -aq --filter status=exited --filter status=created 2>/dev/null || true)
+    [[ -z "$ids" ]] && return 1
+
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        name=$(docker inspect "$id" --format '{{.Name}}' 2>/dev/null | sed 's|^/||') || true
+        image=$(docker inspect "$id" --format '{{.Config.Image}}' 2>/dev/null) || true
+        state=$(docker inspect "$id" --format '{{.State.Status}}' 2>/dev/null) || true
+        echo -e "${GREEN}  ${name:-$id}${ENDCOLOR}  (${image:-unknown}, ${state:-unknown})"
+
+        mounts=$(docker inspect "$id" --format \
+            '{{range .Mounts}}{{.Type}}|{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}|{{.Destination}}{{println}}{{end}}' \
+            2>/dev/null) || true
+
+        if [[ -z "${mounts//[[:space:]]/}" ]]; then
+            echo "      no volumes"
+        else
+            while IFS='|' read -r mtype mname mdest; do
+                [[ -n "$mtype" ]] || continue
+                if [[ "$mtype" == "volume" && "$mname" =~ ^[0-9a-f]{64}$ ]]; then
+                    echo -e "      ${RED}anonymous volume${ENDCOLOR} ${mname} -> ${mdest}"
+                    anon=1
+                else
+                    echo "      ${mtype} ${mname} -> ${mdest}"
+                fi
+            done <<< "$mounts"
         fi
-        
-        # Clean node_modules in common locations (but be careful)
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning node_modules in common locations...${ENDCOLOR}"
-        find /home -name "node_modules" -type d -exec rm -rf {} + 2>/dev/null || true
-        
-        # Clean npm temporary files
-        echo -e "${YELLOW}[Linux-cleanser]:Cleaning npm temporary files...${ENDCOLOR}"
-        find /tmp -name "npm-*" -type d -exec rm -rf {} + 2>/dev/null || true
-        find /tmp -name ".npm" -type d -exec rm -rf {} + 2>/dev/null || true
+    done <<< "$ids"
+
+    if [[ $anon -eq 1 ]]; then
+        echo
+        warn "Some of the containers above hold ANONYMOUS volumes."
+        say "Removing the container does not delete the volume, but it does leave it"
+        say "as an unnamed hash with nothing pointing at it. Copy those hashes"
+        say "somewhere before answering yes, or keep the containers."
+    fi
+    return 0
+}
+
+clean_docker() {
+    command_exists docker || return 0
+    docker info >/dev/null 2>&1 || { say "Docker installed but daemon unreachable, skipping."; return 0; }
+
+    say "Docker usage:"
+    docker system df 2>/dev/null | sed 's/^/    /' || true
+    echo
+
+    if list_stopped_containers; then
+        echo
+        if ask_user "Remove the stopped containers listed above?"; then
+            run docker container prune -f
+        fi
+    fi
+
+    if ask_user "Remove dangling (untagged) images?"; then
+        run docker image prune -f
+    fi
+
+    if ask_user "Prune unused build cache?"; then
+        run docker builder prune -f
+    fi
+
+    if [[ $AGGRESSIVE -eq 1 ]]; then
+        warn "Aggressive mode: the next two remove anything not attached to a running container."
+        ask_user "Remove ALL unused images (forces re-pull later)?" && run docker image prune -a -f
+        ask_user "Remove the ENTIRE build cache (slower rebuilds)?" && run docker builder prune -a -f
+    fi
+
+    # Volumes are deliberately never pruned. "Dangling" only means no container
+    # currently references it, which is also true of every dev database whose
+    # container has been recreated.
+    local dangling
+    dangling=$(docker volume ls -qf dangling=true 2>/dev/null || true)
+    if [[ -n "$dangling" ]]; then
+        echo
+        warn "These Docker volumes are unreferenced but were NOT touched:"
+        echo "$dangling" | sed 's/^/    /'
+        say "Review them yourself — some may hold project databases."
+        say "Remove one with: docker volume rm <name>"
     fi
 }
 
-# Show summary
+clean_flatpak_snap() {
+    if command_exists flatpak; then
+        ask_user "Remove unused Flatpak runtimes?" && run flatpak uninstall --unused -y
+    fi
+
+    if command_exists snap; then
+        if ask_user "Remove disabled (superseded) snap revisions?"; then
+            say "Removing old snap revisions..."
+            run_sh "snap list --all | awk '/disabled/{print \$1, \$3}' | while read -r n r; do snap remove \"\$n\" --revision=\"\$r\"; done"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# User data
+# ---------------------------------------------------------------------------
+
+handle_shell_history() {
+    # Runs as root, so ~ would be /root. Target the real user's files instead.
+    local files=("$REAL_HOME/.bash_history" "$REAL_HOME/.zsh_history")
+    local existing=() f
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] && existing+=("$f")
+    done
+    [[ ${#existing[@]} -eq 0 ]] && return 0
+
+    say "Shell history files for $REAL_USER:"
+    printf '    %s\n' "${existing[@]}"
+    ask_user "Clear shell history? This cannot be undone." || return 0
+    for f in "${existing[@]}"; do
+        run truncate -s 0 "$f"
+    done
+}
+
+empty_trash() {
+    local trash="$REAL_HOME/.local/share/Trash"
+    [[ -d "$trash" ]] || return 0
+    say "Trash: $(human "$(dir_bytes "$trash")")"
+    ask_user "Empty the trash?" || return 0
+    for sub in files info expunged; do
+        [[ -d "$trash/$sub" ]] && reclaim_dir "$trash/$sub" "trash/$sub"
+    done
+}
+
+# ---------------------------------------------------------------------------
+
 show_summary() {
-    echo -e "${YELLOW}[Linux-cleanser]:Script Finished!${ENDCOLOR}"
-    echo -e
-    echo -e $RED"Cleansing complete."$ENDCOLOR
-    echo -e
+    echo
+    if [[ $DRY_RUN -eq 1 ]]; then
+        say "Dry run complete. Nothing was deleted."
+        say "Re-run without --dry-run to apply."
+    else
+        say "Cleansing complete. Freed roughly $(human "$TOTAL_RECLAIMED") in tracked directories."
+        say "Package manager and Docker reclaim is reported inline above."
+    fi
+    log_message "INFO" "Run finished (tracked_reclaimed=$TOTAL_RECLAIMED)"
+    echo
 }
 
-# Main function
 main() {
-    # Show banner
+    parse_args "$@"
     show_banner
-    
-    # Check prerequisites
     check_prerequisites
-    
-    # Show cleanup preview
     show_cleanup_preview
-    
-    # Create backup
-    if ask_user "Do you want to create a package list backup?"; then
-        create_backup
-    fi
-    
-    # Clean package cache
+
+    ask_user "Create a package list backup first?" "y" && create_backup
+
     clean_package_cache
-    
-    # Remove redundant dependencies
-    if ask_user "Do you want to remove redundant dependencies?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Removing redundant dependencies...${ENDCOLOR}"
-        apt-get -y autoremove
-        apt-get -y autoremove --purge
-    fi
-    
-    # Clean old config files
+    clean_autoremove
     handle_old_configs
-    
-    # Clean old kernels
-    handle_old_kernels
-    
-    # Clean system files
+
     clean_journal_logs
+    clean_coredumps
     clean_temp_files
-    clean_old_logs
-    clean_broken_symlinks
-    
-    # Clean user files
+    clean_rotated_logs
+
+    clean_user_caches
     clean_browser_caches
     clean_thumbnail_cache
-    
-    # Clean Node.js/npm safely
-    clean_nodejs_safe
-    
-    # Handle bash history
-    handle_bash_history
-    
-    # Empty trash
-    if ask_user "Do you want to empty the trash?"; then
-        echo -e "${YELLOW}[Linux-cleanser]:Emptying the trash...${ENDCOLOR}"
-        rm -rf /home/*/.local/share/Trash/*/** 2>/dev/null || true
-        rm -rf /root/.local/share/Trash/*/** 2>/dev/null || true
-    fi
-    
-    # Show summary
+
+    clean_dev_caches
+    clean_docker
+    clean_flatpak_snap
+
+    handle_shell_history
+    empty_trash
+
     show_summary
 }
 
-# Execute main function
 main "$@"
